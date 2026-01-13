@@ -48,6 +48,7 @@ class MegatronBackend(BackendBase):
         with_test=False,
         root_dir=None,
         enable_monitoring=False,
+        enable_in_process_monitoring=False,
     ):
         system_config = config.train.system
         logging_config = config.train.system.logging
@@ -93,6 +94,43 @@ class MegatronBackend(BackendBase):
             f.write(f"\n")
             f.write(f"export PYTHONPATH={root_dir}:{megatron_dir}:${{PYTHONPATH}}\n")
             f.write(f"\n")
+            # In-process monitoring environment variables
+            if enable_in_process_monitoring:
+                f.write(f"# In-process monitoring configuration\n")
+                f.write(f"export FLAGSCALE_IN_PROCESS_MONITORING=1\n")
+                in_process_config = config.experiment.runner.get("in_process", {})
+                if in_process_config.get("heartbeat_interval"):
+                    f.write(
+                        f"export FLAGSCALE_HEARTBEAT_INTERVAL={in_process_config.heartbeat_interval}\n"
+                    )
+                if in_process_config.get("health_check_interval"):
+                    f.write(
+                        f"export FLAGSCALE_HEALTH_CHECK_INTERVAL={in_process_config.health_check_interval}\n"
+                    )
+                if in_process_config.get("enable_cuda_check") is not None:
+                    val = "1" if in_process_config.enable_cuda_check else "0"
+                    f.write(f"export FLAGSCALE_ENABLE_CUDA_CHECK={val}\n")
+                if in_process_config.get("enable_nvml_check") is not None:
+                    val = "1" if in_process_config.enable_nvml_check else "0"
+                    f.write(f"export FLAGSCALE_ENABLE_NVML_CHECK={val}\n")
+                # Set monitor log directory
+                monitor_log_dir = (
+                    in_process_config.get("log_dir", None) or system_config.logging.log_dir
+                )
+                f.write(f"export FLAGSCALE_MONITOR_LOG_DIR={monitor_log_dir}/in_process_monitor\n")
+                # Restart-related environment variables
+                if in_process_config.get("enable_restart") is not None:
+                    val = "1" if in_process_config.enable_restart else "0"
+                    f.write(f"export FLAGSCALE_ENABLE_RESTART={val}\n")
+                if in_process_config.get("max_restarts") is not None:
+                    f.write(f"export FLAGSCALE_MAX_RESTARTS={in_process_config.max_restarts}\n")
+                if in_process_config.get("min_world_size") is not None:
+                    f.write(f"export FLAGSCALE_MIN_WORLD_SIZE={in_process_config.min_world_size}\n")
+                if in_process_config.get("restart_on_exception") is not None:
+                    val = "1" if in_process_config.restart_on_exception else "0"
+                    f.write(f"export FLAGSCALE_RESTART_ON_EXCEPTION={val}\n")
+
+                f.write(f"\n")
             f.write(f'cmd="{cmd}"\n')
             f.write(f"\n")
             if enable_monitoring:

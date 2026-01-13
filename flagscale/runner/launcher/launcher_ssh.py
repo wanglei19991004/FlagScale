@@ -101,6 +101,11 @@ def _get_runner_cmd_train(
         del runner_args["master_port"]
     if "enable_monitoring" in runner_args:
         del runner_args["enable_monitoring"]
+    if "enable_in_process_monitoring" in runner_args:
+        del runner_args["enable_in_process_monitoring"]
+    if "in_process" in runner_args:
+        del runner_args["in_process"]
+
     runner_args["rdzv_id"] = rdzv_id
     # runner_args["master_addr"] = master_addr
     # runner_args["master_port"] = master_port
@@ -138,6 +143,7 @@ def run_node(
     dryrun,
     cur_envs,
     enable_monitoring,
+    enable_in_process_monitoring=False,
 ):
     cur_envs = update_nodes_envs(user_envs, host, resource_info)
     # Get the number of visible devices from the environment variable, e.g. CUDA_VISIBLE_DEVICES, MLU_VISIBLE_DEVICES
@@ -163,6 +169,7 @@ def run_node(
         dryrun=dryrun,
         cur_envs=cur_envs,
         enable_monitoring=enable_monitoring,
+        enable_in_process_monitoring=enable_in_process_monitoring,
     )
 
 
@@ -190,6 +197,7 @@ class SshLauncher(LauncherBase):
         dryrun=False,
         cur_envs=None,
         enable_monitoring=False,
+        enable_in_process_monitoring=False,
     ):
         export_cmd = []
         if cur_envs:
@@ -263,6 +271,7 @@ class SshLauncher(LauncherBase):
                 with_test=with_test,
                 root_dir=node_specific_config.get("build_dir", None),
                 enable_monitoring=enable_monitoring,
+                enable_in_process_monitoring=enable_in_process_monitoring,
             )
         elif self.task_type == "rl":
             host_run_script_file = self.backend.generate_run_script(
@@ -300,11 +309,21 @@ class SshLauncher(LauncherBase):
                 run_local_command(f"bash {host_run_script_file}", dryrun)
 
     def run(
-        self, with_test=False, dryrun=False, monitor=False, interval=10, enable_monitoring=None
+        self,
+        with_test=False,
+        dryrun=False,
+        monitor=False,
+        interval=10,
+        enable_monitoring=None,
+        enable_in_process_monitoring=None,
     ):
         # Read from config if not explicitly provided
         if enable_monitoring is None:
             enable_monitoring = self.config.experiment.runner.get("enable_monitoring", False)
+        if enable_in_process_monitoring is None:
+            enable_in_process_monitoring = self.config.experiment.runner.get(
+                "enable_in_process_monitoring", False
+            )
         num_visible_devices = None
         visible_devices = self.user_envs.get("CUDA_VISIBLE_DEVICES", None)
         if visible_devices is not None and isinstance(visible_devices, str):
@@ -354,6 +373,7 @@ class SshLauncher(LauncherBase):
                             dryrun,
                             None,
                             enable_monitoring,
+                            enable_in_process_monitoring,
                         )
                         tasks.append(args)
                     pool.starmap(run_node, tasks)
@@ -396,6 +416,7 @@ class SshLauncher(LauncherBase):
                 dryrun=dryrun,
                 cur_envs=self.user_envs,
                 enable_monitoring=enable_monitoring,
+                enable_in_process_monitoring=enable_in_process_monitoring,
             )
         # If need monitor, query status continually
         if monitor:

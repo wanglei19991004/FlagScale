@@ -146,6 +146,16 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 # Import PEFT from peft module
 from megatron.training.peft import PEFT
 
+# FlagScale in-process monitoring (optional)
+try:
+    from flagscale.runner.in_process import init_from_env as init_in_process_monitoring
+    from flagscale.runner.in_process import shutdown_in_process_monitoring, ping as in_process_ping
+    HAS_IN_PROCESS_MONITOR = True
+except ImportError:
+    HAS_IN_PROCESS_MONITOR = False
+    init_in_process_monitoring = None
+    shutdown_in_process_monitoring = None
+    in_process_ping = None
 
 def destroy_global_state():
     destroy_global_vars()
@@ -825,6 +835,7 @@ def pretrain(
             flag_gems.enable(record=True, once=True, unused=args.flag_gems_unused, path=args.flag_gems_log_path)
         except Exception as e:
             raise RuntimeError(f"Failed to enable 'flag_gems': {e}.")
+    
     ###### FlagScale End   ######
 
     if args.log_progress:
@@ -2712,6 +2723,20 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+    
+        # ====== TEST CODE: Simulate fault for restart testing ======
+        # TODO: Remove this after testing
+        _fault_marker_file = "/tmp/flagscale_test_fault_triggered"
+        if iteration == 10 and args.rank == 0 and not os.path.exists(_fault_marker_file):
+            with open(_fault_marker_file, 'w') as f:
+                f.write(str(iteration))
+            raise RuntimeError("Simulated fault for testing restart")
+        # ====== END TEST CODE ======
+
+        # FlagScale: Send heartbeat ping for in-process monitoring
+        if HAS_IN_PROCESS_MONITOR and in_process_ping is not None:
+            in_process_ping(iteration=iteration)
+
         batch_size = (
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
         )
@@ -2917,7 +2942,14 @@ def train(
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
+        # Shutdown FlagScale in-process monitoring
+        if HAS_IN_PROCESS_MONITOR and shutdown_in_process_monitoring is not None:
+            shutdown_in_process_monitoring()
         sys.exit(exit_code)
+    
+    # Shutdown FlagScale in-process monitoring
+    if HAS_IN_PROCESS_MONITOR and shutdown_in_process_monitoring is not None:
+        shutdown_in_process_monitoring()
 
     return iteration, num_floating_point_operations_so_far
 
