@@ -126,7 +126,12 @@ class WrapperConfig:
     max_restart_delay: float = 60.0
 
     # Cross-rank synchronization for restart
-    restart_sync_barrier_timeout: float = 120.0  # Timeout for restart sync barriers
+    # Use a longer timeout for multi-node scenarios and slow cleanup operations
+    restart_sync_barrier_timeout: float = 300.0  # Timeout for restart sync barriers
+
+    # Watchdog configuration
+    enable_watchdog: bool = False
+    watchdog_timeout: float = 60.0
 
     @classmethod
     def from_dict(cls, config: Dict[str, Any]) -> "WrapperConfig":
@@ -195,6 +200,9 @@ class Wrapper:
         max_restarts: int = None,
         min_world_size: int = None,
         restart_on_exception: bool = None,
+        # Watchdog configuration
+        enable_watchdog: bool = None,
+        watchdog_timeout: float = None,
         # Callbacks
         on_health_check_failed: Callable[[HealthCheckResult], None] = None,
         on_fault: Callable[[str, Optional[Exception]], None] = None,
@@ -217,6 +225,8 @@ class Wrapper:
             max_restarts: Maximum restart attempts
             min_world_size: Minimum world size to continue
             restart_on_exception: Restart on uncaught exceptions
+            enable_watchdog: Enable progress watchdog
+            watchdog_timeout: Timeout for watchdog
             on_health_check_failed: Callback when health check fails
             on_fault: Callback when fault is recorded
             on_iteration: Callback on each iteration ping
@@ -255,6 +265,10 @@ class Wrapper:
             self.config.min_world_size = min_world_size
         if restart_on_exception is not None:
             self.config.restart_on_exception = restart_on_exception
+        if enable_watchdog is not None:
+            self.config.enable_watchdog = enable_watchdog
+        if watchdog_timeout is not None:
+            self.config.watchdog_timeout = watchdog_timeout
 
         # Callbacks
         self.on_health_check_failed = on_health_check_failed
@@ -287,8 +301,15 @@ class Wrapper:
                 timeout=self.config.restart_sync_barrier_timeout,
             )
 
+            # Rank 0 eagerly initializes the TCPStore server
+            # This ensures the server is ready before other ranks try to connect
+            if self.rank == 0 and self._restart_coordinator is not None:
+                logger.info("Rank 0: Eagerly initializing RestartCoordinator TCPStore...")
+                self._restart_coordinator._ensure_store()
+
         # State
         self._monitor: Optional[InProcessMonitor] = None
+        self._watchdog: Optional[ProgressWatchdog] = None
         self._started = False
         self._iteration = 0
 
@@ -370,6 +391,20 @@ class Wrapper:
             enable_restart_on_failure=enable_restart_on_failure,
         )
         self._monitor.start()
+
+        # Start watchdog if enabled
+        if self.config.enable_watchdog and not self._watchdog:
+            # Helper for watchdog hang detection
+            def on_hang(age):
+                if self.config.restart_on_hang:
+                    reason = f"Watchdog hang detected: no progress for {age:.1f}s"
+                    self.trigger_restart(reason, fault_type="watchdog_hang")
+
+            self._watchdog = ProgressWatchdog(
+                timeout=self.config.watchdog_timeout, on_hang_detected=on_hang
+            )
+            self._watchdog.start()
+
         self._started = True
 
         logger.info(
@@ -388,6 +423,10 @@ class Wrapper:
         if self._monitor:
             self._monitor.stop()
             self._monitor = None
+
+        if self._watchdog:
+            self._watchdog.shutdown()
+            self._watchdog = None
 
         self._started = False
         logger.info(f"Wrapper stopped for rank {self.rank}")
@@ -416,6 +455,9 @@ class Wrapper:
 
         self._monitor.ping(iteration, phase, metrics)
 
+        if self._watchdog:
+            self._watchdog.ping()
+
         if self.on_iteration and iteration is not None:
             self.on_iteration(iteration)
 
@@ -435,21 +477,29 @@ class Wrapper:
         """Signal entering checkpoint save/load phase."""
         if self._monitor:
             self._monitor.enter_checkpoint_phase()
+        if self._watchdog:
+            self._watchdog.pause_and_synchronize()
 
     def exit_checkpoint_phase(self) -> None:
         """Signal exiting checkpoint phase."""
         if self._monitor:
             self._monitor.exit_checkpoint_phase()
+        if self._watchdog:
+            self._watchdog.resume()
 
     def enter_initialization_phase(self) -> None:
         """Signal entering initialization phase."""
         if self._monitor:
             self._monitor.enter_initialization_phase()
+        if self._watchdog:
+            self._watchdog.pause_and_synchronize()
 
     def exit_initialization_phase(self) -> None:
         """Signal exiting initialization phase."""
         if self._monitor:
             self._monitor.exit_initialization_phase()
+        if self._watchdog:
+            self._watchdog.resume()
 
     def record_fault(self, reason: str, error: Exception = None) -> int:
         """Record a fault occurrence.
@@ -561,12 +611,28 @@ class Wrapper:
                     if delay > 0:
                         logger.debug(f"Waiting {delay:.1f}s before restart...")
                         time.sleep(delay)
+                # Dynamic Port Rotation
+                # This ensures we don't hit "Address already in use" from previous attempt
+                if self._state.restart_attempt > 0:
+                    try:
+                        base_port = int(
+                            os.environ.get("MASTER_PORT_BASE", os.environ.get("MASTER_PORT", 29500))
+                        )
+                        new_port = base_port + self._state.restart_attempt
+                        os.environ["MASTER_PORT"] = str(new_port)
+                        logger.info(
+                            f"Rank {self.rank}: Rotated MASTER_PORT to {new_port} for attempt {self._state.restart_attempt}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Rank {self.rank}: Failed to rotate port: {e}")
 
                 # 2. Start monitoring
                 self.start()
+                self.enter_initialization_phase()
 
                 # 3. Execute the training function
                 self._state.set_mode(RankMode.ACTIVE)
+                self.exit_initialization_phase()
                 result = fn(*args, **kwargs)
 
                 # 4. Success - exit the loop
@@ -587,7 +653,8 @@ class Wrapper:
                         reason=e.reason,
                         iteration=self._iteration,
                     )
-
+                # Note: Synchronization barriers are handled in _handle_restart()
+                # to avoid duplicate barrier points
                 self._handle_restart(e.reason, e.original_error)
                 continue
 
@@ -610,7 +677,8 @@ class Wrapper:
                             reason=f"Exception: {type(e).__name__}",
                             iteration=self._iteration,
                         )
-
+                    # Note: Synchronization barriers are handled in _handle_restart()
+                    # to avoid duplicate barrier points
                     self._handle_restart(f"Exception: {type(e).__name__}", e)
                     continue
                 else:
@@ -681,7 +749,9 @@ class Wrapper:
 
         logger.info(f"Rank {self.rank}: Prepared for restart attempt {self._state.restart_attempt}")
 
-    def trigger_restart(self, reason: str, error: Exception = None) -> None:
+    def trigger_restart(
+        self, reason: str, error: Exception = None, fault_type: str = "manual"
+    ) -> None:
         """Manually trigger a restart.
 
         This can be called from within the training function to trigger
@@ -690,6 +760,7 @@ class Wrapper:
         Args:
             reason: Reason for the restart
             error: Associated error if any
+            fault_type: Type of fault (manual, health_check, etc.)
 
         Raises:
             RankShouldRestart: Always raised to trigger the restart
@@ -705,7 +776,7 @@ class Wrapper:
             logger.info(f"Rank {self.rank}: Broadcast manual restart request: {reason}")
 
         raise RankShouldRestart(
-            reason=reason, rank=self.rank, original_error=error, fault_type="manual"
+            reason=reason, rank=self.rank, original_error=error, fault_type="fault_type"
         )
 
     def __call__(self, fn: Callable) -> Callable:

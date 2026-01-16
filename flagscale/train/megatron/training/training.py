@@ -794,6 +794,10 @@ def pretrain(
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
     """
+    # Set CUDA device early to avoid NCCL barrier "devices unknown" warning
+    # This must happen before any distributed operations
+    #if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
+    #    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -846,6 +850,10 @@ def pretrain(
     if args.enable_ft_package:
         ft_integration.setup(args)
         ft_integration.maybe_setup_simulated_fault()
+    # Initialize in-process monitoring (from environment variables)
+    # This enables heartbeat monitoring, health checks, and optional restart on fault
+    if HAS_IN_PROCESS_MONITOR and init_in_process_monitoring is not None:
+        init_in_process_monitoring()
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
@@ -2724,18 +2732,23 @@ def train(
 
         iteration += 1
     
-        # ====== TEST CODE: Simulate fault for restart testing ======
-        # TODO: Remove this after testing
-        _fault_marker_file = "/tmp/flagscale_test_fault_triggered"
-        if iteration == 10 and args.rank == 0 and not os.path.exists(_fault_marker_file):
-            with open(_fault_marker_file, 'w') as f:
-                f.write(str(iteration))
-            raise RuntimeError("Simulated fault for testing restart")
-        # ====== END TEST CODE ======
-
         # FlagScale: Send heartbeat ping for in-process monitoring
         if HAS_IN_PROCESS_MONITOR and in_process_ping is not None:
             in_process_ping(iteration=iteration)
+            # Helper logic for testing: Manual Restart Trigger
+            trigger_step = int(os.environ.get("TRIGGER_RESTART_STEP", -1))
+            if trigger_step > 0 and iteration == trigger_step:
+                # Import wrapper directly to access trigger method since it's not exposed via __init__ yet
+                try:
+                    from flagscale.runner.in_process.wrap import Wrapper
+                    wrapper = Wrapper.get_instance()
+                    if wrapper:
+                        print_rank_0(f"!!! MANUALLY TRIGGERING RESTART AT STEP {iteration} !!!")
+                        # Prevent infinite loop: Unset trigger for the next in-process run
+                        os.environ["TRIGGER_RESTART_STEP"] = "-1"
+                        wrapper.trigger_restart(f"Manual Test at step {iteration}")
+                except ImportError:
+                    pass
 
         batch_size = (
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()

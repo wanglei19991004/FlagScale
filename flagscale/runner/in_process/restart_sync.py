@@ -89,6 +89,9 @@ class RestartCoordinator:
         Note: TCPStore initialization is deferred and lazy. It will be
         created on first actual use to avoid blocking during Wrapper init.
 
+        For non-master ranks, we retry connection in case rank 0 hasn't
+        created the server yet (race condition).
+
         Returns:
             True if store is available, False otherwise
         """
@@ -99,39 +102,61 @@ class RestartCoordinator:
             # Don't retry if init already failed
             return False
 
-        try:
-            import torch.distributed as dist
+        import torch.distributed as dist
 
-            # Rank 0 is the master (creates the store)
-            is_master = self.rank == 0
+        # Rank 0 is the master (creates the store)
+        is_master = self.rank == 0
 
-            logger.info(
-                f"Rank {self.rank}: Creating TCPStore "
-                f"(master={is_master}, addr={self.master_addr}:{self.store_port})"
-            )
+        # Non-master ranks may need to retry if master hasn't created store yet
+        max_retries = 1 if is_master else 10
+        retry_delay = 2.0  # seconds between retries
 
-            # Use wait_for_workers=False to avoid blocking
-            # Each rank will connect when ready
-            self._store = dist.TCPStore(
-                host_name=self.master_addr,
-                port=self.store_port,
-                world_size=self.world_size,
-                is_master=is_master,
-                timeout=timedelta(seconds=self.timeout),
-                wait_for_workers=False,  # Don't block waiting for all workers
-            )
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    logger.info(
+                        f"Rank {self.rank}: Retrying TCPStore connection "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
 
-            self._initialized = True
-            logger.info(
-                f"Rank {self.rank}: RestartCoordinator TCPStore ready "
-                f"(store={self.master_addr}:{self.store_port})"
-            )
-            return True
+                logger.info(
+                    f"Rank {self.rank}: Creating TCPStore "
+                    f"(master={is_master}, addr={self.master_addr}:{self.store_port})"
+                )
 
-        except Exception as e:
-            logger.warning(f"Rank {self.rank}: Failed to initialize TCPStore: {e}")
-            self._init_failed = True
-            return False
+                # Use wait_for_workers=False to avoid blocking
+                # Each rank will connect when ready
+                # Use a timeout that's at least as long as barrier_timeout, with extra margin
+                # for multi-node scenarios and slow cleanup operations
+                store_timeout_s = max(float(self.timeout), 600.0)
+
+                self._store = dist.TCPStore(
+                    host_name=self.master_addr,
+                    port=self.store_port,
+                    world_size=self.world_size,
+                    is_master=is_master,
+                    timeout=timedelta(seconds=30),  # Short timeout for connection
+                    wait_for_workers=False,  # Don't block waiting for all workers
+                )
+
+                self._initialized = True
+                logger.info(
+                    f"Rank {self.rank}: RestartCoordinator TCPStore ready "
+                    f"(store={self.master_addr}:{self.store_port})"
+                )
+                return True
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.debug(
+                        f"Rank {self.rank}: TCPStore connection attempt {attempt + 1} failed: {e}"
+                    )
+                    time.sleep(retry_delay)
+                else:
+                    logger.warning(f"Rank {self.rank}: Failed to initialize TCPStore: {e}")
+                    self._init_failed = True
+                return False
+        return False
 
     def request_restart(self, attempt: int, rank: int, reason: str, iteration: int = 0) -> bool:
         """Request a restart for the current attempt.
@@ -158,20 +183,27 @@ class RestartCoordinator:
             # Value format: <rank>|<iteration>|<reason>
             value = f"{rank}|{iteration}|{reason}"
 
-            # Use compare_set for idempotent publish (first writer wins)
-            # If key doesn't exist, set it. If it exists, keep existing value.
-            try:
+            # First-writer wins: only set if key doesn't exist
+            # Note: store.check() returns True/False directly in some versions, or list of bools in others
+            check_result = self._store.check([key])
+            if isinstance(check_result, list):
+                exists = check_result[0]
+            else:
+                exists = check_result
+
+            if not exists:
                 self._store.set(key, value)
-            except Exception:
-                # Key might already exist, which is fine
-                pass
 
             # Also store the reason separately for easy retrieval
             reason_key = f"{self.KEY_RESTART_REASON}/{attempt}"
-            try:
+            check_result = self._store.check([reason_key])
+            if isinstance(check_result, list):
+                exists = check_result[0]
+            else:
+                exists = check_result
+
+            if not exists:
                 self._store.set(reason_key, reason)
-            except Exception:
-                pass
 
             logger.debug(
                 f"Rank {self.rank}: Published restart request for attempt {attempt}: {reason}"
@@ -194,18 +226,10 @@ class RestartCoordinator:
         if not self._ensure_store():
             return False
 
+        key = f"{self.KEY_RESTART_REQUEST}/{attempt}"
         try:
-            key = f"{self.KEY_RESTART_REQUEST}/{attempt}"
-
-            # Check if key exists
-            try:
-                # num_keys() and check() are not universally available,
-                # so we try to get the value
-                value = self._store.get(key)
-                return value is not None and len(value) > 0
-            except Exception:
-                # Key doesn't exist
-                return False
+            # Use non-blocking check() instead of blocking get()
+            return bool(self._store.check([key])[0])
 
         except Exception as e:
             logger.debug(f"Rank {self.rank}: Error checking restart request: {e}")
@@ -223,14 +247,15 @@ class RestartCoordinator:
         if not self._ensure_store():
             return None
 
+        reason_key = f"{self.KEY_RESTART_REASON}/{attempt}"
         try:
-            reason_key = f"{self.KEY_RESTART_REASON}/{attempt}"
-            try:
-                value = self._store.get(reason_key)
-                if value:
-                    return value.decode() if isinstance(value, bytes) else str(value)
-            except Exception:
-                pass
+            # First check if key exists (non-blocking), then get if it does
+            if not bool(self._store.check([reason_key])[0]):
+                return None
+            value = self._store.get(reason_key)  # Key exists, won't block
+            if value:
+                return value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
+
             return None
 
         except Exception as e:
@@ -258,48 +283,23 @@ class RestartCoordinator:
         if timeout_s is None:
             timeout_s = self.timeout
 
-        try:
-            # Key format: barrier/<name>/<attempt>/<rank>
-            my_key = f"{self.KEY_BARRIER}/{name}/{attempt}/{self.rank}"
+        # Key format: barrier/<name>/<attempt>/<rank>
+        my_key = f"{self.KEY_BARRIER}/{name}/{attempt}/{self.rank}"
+        all_keys = [f"{self.KEY_BARRIER}/{name}/{attempt}/{r}" for r in range(self.world_size)]
 
+        try:
             # Signal that this rank has arrived
             self._store.set(my_key, "1")
             logger.debug(f"Rank {self.rank}: Arrived at barrier '{name}' (attempt {attempt})")
-
-            # Wait for all ranks to arrive
-            start_time = time.time()
-            while True:
-                arrived_count = 0
-                for r in range(self.world_size):
-                    key = f"{self.KEY_BARRIER}/{name}/{attempt}/{r}"
-                    try:
-                        value = self._store.get(key)
-                        if value:
-                            arrived_count += 1
-                    except Exception:
-                        pass
-
-                if arrived_count >= self.world_size:
-                    logger.debug(
-                        f"Rank {self.rank}: Barrier '{name}' complete "
-                        f"({arrived_count}/{self.world_size} ranks)"
-                    )
-                    return True
-
-                # Check timeout
-                elapsed = time.time() - start_time
-                if elapsed >= timeout_s:
-                    logger.warning(
-                        f"Rank {self.rank}: Barrier '{name}' timeout after {elapsed:.1f}s "
-                        f"({arrived_count}/{self.world_size} ranks arrived)"
-                    )
-                    return False
-
-                # Brief sleep to avoid busy-waiting
-                time.sleep(0.1)
-
+            # Use store.wait() primitive instead of polling with get()
+            self._store.wait(all_keys, timedelta(seconds=float(timeout_s)))
+            logger.debug(
+                f"Rank {self.rank}: Barrier '{name}' complete "
+                f"({self.world_size}/{self.world_size} ranks)"
+            )
+            return True
         except Exception as e:
-            logger.warning(f"Rank {self.rank}: Barrier '{name}' failed: {e}")
+            logger.warning(f"Rank {self.rank}: Barrier '{name}' failed/timeout: {e}")
             return False
 
     def cleanup(self, attempt: int) -> None:
